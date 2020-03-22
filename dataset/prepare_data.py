@@ -5,7 +5,7 @@ NOTE: You will want to do this using several processes. I did this on an AWS mac
 as that's where I had the deduplicated RealNews dataset.
 """
 import argparse
-import ujson as json
+import json as json
 # from sample.encoder import get_encoder, tokenize_for_grover_training, detokenize, sliding_window, create_int_feature
 import random
 import tensorflow as tf
@@ -48,7 +48,7 @@ parser.add_argument(
 parser.add_argument(
     '-input_fn',
     dest='input_fn',
-    default='realnews.jsonl',
+    default='/Users/zchai/PycharmProjects/gpt2-ml/data/test_data.dat',
     type=str,
     help='Base filename to use. THIS MUST BE A LOCAL FILE.'
 )
@@ -66,40 +66,19 @@ random.seed(args.seed + args.fold)
 
 #encoder = get_encoder()
 tokenizer = tokenization.FullTokenizer(
-    vocab_file="bert-base-chinese-vocab.txt", do_lower_case=True)
+    vocab_file="/Users/zchai/PycharmProjects/gpt2-ml/tokenization/bert-base-chinese-vocab.txt", do_lower_case=True)
 
 
 class S3TFRecordWriter(object):
     def __init__(self, fn):
         self.fn = fn
-        if fn.startswith('s3://'):
-            from boto3.s3.transfer import TransferConfig
-            import boto3
-            self.gclient = None
-            self.s3client = boto3.client('s3',
-                                         )
-            self.storage_dir = TemporaryDirectory()
-            self.writer = tf.python_io.TFRecordWriter(
-                os.path.join(self.storage_dir.name, 'temp.tfrecord'))
-            self.bucket_name, self.file_name = self.fn.split(
-                's3://', 1)[1].split('/', 1)
-        elif fn.startswith('gs://'):
-            from google.cloud import storage
-            self.s3client = None
-            self.gclient = storage.Client()
-            self.storage_dir = TemporaryDirectory()
-            self.writer = tf.python_io.TFRecordWriter(
-                os.path.join(self.storage_dir.name, 'temp.tfrecord'))
-            self.bucket_name, self.file_name = self.fn.split(
-                'gs://', 1)[1].split('/', 1)
 
-        else:
-            self.s3client = None
-            self.gclient = None
-            self.bucket_name = None
-            self.file_name = None
-            self.storage_dir = None
-            self.writer = tf.python_io.TFRecordWriter(fn)
+        self.s3client = None
+        self.gclient = None
+        self.bucket_name = None
+        self.file_name = None
+        self.storage_dir = None
+        self.writer = tf.io.TFRecordWriter(fn)
 
     def write(self, x):
         self.writer.write(x)
@@ -107,23 +86,6 @@ class S3TFRecordWriter(object):
     def close(self):
         self.writer.close()
 
-        if self.s3client is not None:
-            from boto3.s3.transfer import TransferConfig
-            config = TransferConfig(multipart_threshold=1024 * 25, max_concurrency=10,
-                                    multipart_chunksize=1024 * 25, use_threads=True)
-            self.s3client.upload_file(
-                os.path.join(self.storage_dir.name, 'temp.tfrecord'),
-                self.bucket_name,
-                self.file_name,
-                ExtraArgs={'ACL': 'public-read'}, Config=config,
-            )
-            self.storage_dir.cleanup()
-        if self.gclient is not None:
-            bucket = self.gclient.get_bucket(self.bucket_name)
-            blob = bucket.blob(self.file_name)
-            blob.upload_from_filename(os.path.join(
-                self.storage_dir.name, 'temp.tfrecord'))
-            self.storage_dir.cleanup()
 
     def __enter__(self):
         # Called when entering "with" context.
@@ -139,29 +101,30 @@ class S3TFRecordWriter(object):
 def article_iterator(tokenizer):
     """ Iterate through the provided filename + tokenize"""
     assert os.path.exists(args.input_fn)
-    for (dirpath, dirnames, filenames) in os.walk(args.input_fn):
-        for filename in filenames:
-            with open(os.path.join(dirpath, filename), 'r') as f:
-                for l_no, l in enumerate(f):
-                    if l_no % args.num_folds == args.fold:
-                        article = json.loads(l)
+    dirpath, file_name = os.path.split(args.input_fn)
+    file_names = os.listdir(dirpath)
+    for file in file_names:
+        with open(os.path.join(dirpath, file), 'r') as f:
+            for l_no, l in enumerate(f):
+                if l_no % args.num_folds == args.fold:
+                    article = json.loads(l)
 
-                        line = tokenization.convert_to_unicode(
-                            article['text'])  # for news2016zh text body
-                        tokens = tokenizer.tokenize(line)
-                        input_ids = tokenizer.convert_tokens_to_ids(tokens)
+                    line = tokenization.convert_to_unicode(
+                        article['text'])  # for news2016zh text body
+                    tokens = tokenizer.tokenize(line)
+                    input_ids = tokenizer.convert_tokens_to_ids(tokens)
 
-                        article['input_ids'] = input_ids
+                    article['input_ids'] = input_ids
 
-                        article['inst_index'] = (l_no // args.num_folds)
-                        if article['inst_index'] < 100:
-                            print('---\nINPUT{}. {}\n---\nTokens: {}\n'.format(article['inst_index'],
-                                                                            tokens,
-                                                                            input_ids
-                                                                            ), flush=True)
-                        if len(article['input_ids']) <= 64:  # min size of article
-                            continue
-                        yield article
+                    article['inst_index'] = (l_no // args.num_folds)
+                    if article['inst_index'] < 100:
+                        print('---\nINPUT{}. {}\n---\nTokens: {}\n'.format(article['inst_index'],
+                                                                        tokens,
+                                                                        input_ids
+                                                                        ), flush=True)
+                    if len(article['input_ids']) <= 64:  # min size of article
+                        continue
+                    yield article
 
 
 def create_int_feature(values):
@@ -170,7 +133,7 @@ def create_int_feature(values):
     return feature
 
 
-def buffered_and_sliding_window_article_iterator(tokenizer, final_desired_size=1025):
+def  buffered_and_sliding_window_article_iterator(tokenizer, final_desired_size=1025):
     """ We apply a sliding window to fix long sequences, and use a buffer that combines short sequences."""
     for article in article_iterator(tokenizer):
         if len(article['input_ids']) >= final_desired_size:
